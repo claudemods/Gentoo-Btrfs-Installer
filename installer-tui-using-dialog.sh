@@ -52,13 +52,59 @@ configure_fastest_mirrors() {
 select_kernel() {
     KERNEL_CHOICE=$(dialog --title "Kernel Selection" --menu "Select kernel:" 15 45 5 \
         "gentoo-kernel-bin" "Pre-built generic kernel" \
-        "gentoo-kernel" "Gentoo kernel with custom config" \
-        "vanilla-kernel" "Latest stable upstream kernel" \
-        "linux-hardened" "Hardened kernel with security features" \
-        "linux-zen" "Zen kernel tuned for performance" 3>&1 1>&2 2>&3)
+        "gentoo-sources" "Gentoo kernel with custom config" \
+        "vanilla-sources" "Latest stable upstream kernel" \
+        "hardened-sources" "Hardened kernel with security features" \
+        "linux-zen-sources" "Zen kernel tuned for performance" 3>&1 1>&2 2>&3)
     
     # Additional kernel parameters
     KERNEL_PARAMS=$(dialog --title "Kernel Parameters" --inputbox "Enter additional kernel parameters (leave empty for default):" 8 70 3>&1 1>&2 2>&3)
+}
+
+install_kernel() {
+    if [ "$KERNEL_CHOICE" = "gentoo-kernel-bin" ]; then
+        # Install binary kernel
+        cyan_output emerge --quiet sys-kernel/gentoo-kernel-bin
+    else
+        # Install kernel sources
+        cyan_output emerge --quiet sys-kernel/${KERNEL_CHOICE}
+        cyan_output emerge --quiet sys-kernel/linux-firmware
+        
+        # Configure kernel
+        cd /usr/src/linux
+        if [ ! -f .config ]; then
+            if [ -f /proc/config.gz ]; then
+                zcat /proc/config.gz > .config
+            else
+                make defconfig
+            fi
+        fi
+        
+        # Make kernel configuration more user-friendly
+        if command -v nconfig >/dev/null; then
+            make nconfig
+        elif command -v menuconfig >/dev/null; then
+            make menuconfig
+        else
+            echo -e "${CYAN}No kernel configurator found, using default config${NC}"
+        fi
+        
+        # Compile and install kernel
+        cyan_output make -j$(nproc)
+        cyan_output make modules_install
+        cyan_output make install
+        
+        # Generate initramfs
+        cyan_output emerge --quiet sys-kernel/dracut
+        dracut --hostonly --kver $(ls /lib/modules | sort -V | tail -n 1)
+    fi
+    
+    # Update bootloader configuration
+    if [ "$BOOTLOADER" = "GRUB" ]; then
+        grub-mkconfig -o /boot/grub/grub.cfg
+    elif [ "$BOOTLOADER" = "rEFInd" ]; then
+        refind-install
+    fi
 }
 
 perform_installation() {
@@ -201,15 +247,10 @@ emerge-webrsync
 echo 'USE="X wayland pulseaudio dbus networkmanager"' >> /etc/portage/make.conf
 echo "MAKEOPTS=\"-j$(nproc)\"" >> /etc/portage/make.conf
 
-# Install kernel
-emerge --quiet sys-kernel/$KERNEL_CHOICE
-
-# Configure kernel (if not using binary kernel)
-if [ "$KERNEL_CHOICE" != "gentoo-kernel-bin" ]; then
-    emerge --quiet sys-kernel/linux-firmware
-    emerge --quiet sys-kernel/installkernel-gentoo
-    echo "sys-kernel/$KERNEL_CHOICE $KERNEL_PARAMS" >> /etc/portage/package.use/gentoo-kernel
-fi
+# Install kernel and related tools
+emerge --quiet sys-kernel/installkernel-gentoo
+$(declare -f install_kernel)
+install_kernel
 
 # Install desktop environment
 case "$DESKTOP_ENV" in
