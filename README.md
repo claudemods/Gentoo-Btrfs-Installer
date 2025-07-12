@@ -1,2 +1,2 @@
 # Gentoo-Btrfs-Installer
-bash script to install alpine as btrfs with any desktop
+bash script to install gentoo as btrfs with any desktop
