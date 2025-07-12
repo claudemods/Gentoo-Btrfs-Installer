@@ -1,7 +1,12 @@
 #!/bin/bash
 
-# Gentoo Linux UEFI-only BTRFS Installation (Binary Packages Only)
+# Gentoo Linux UEFI-only BTRFS Installation with Multiple Init Systems
 set -e
+
+# Install dialog if missing
+if ! command -v dialog >/dev/null; then
+    emerge --quiet dialog >/dev/null 2>&1
+fi
 
 # Colors
 RED='\033[38;2;255;0;0m'
@@ -31,8 +36,8 @@ configure_fastest_mirrors() {
     case $response in
         0) 
             echo -e "${CYAN}Finding fastest mirrors...${NC}"
-            emerge --quiet --noreplace mirrorselect >/dev/null 2>&1
-            mirrorselect -i -o >> /etc/portage/make.conf
+            emerge --quiet app-portage/mirrorselect >/dev/null 2>&1
+            mirrorselect -s4 -D -o >> /etc/portage/make.conf
             echo -e "${CYAN}Mirrorlist updated with fastest mirrors${NC}"
             ;;
         1) 
@@ -45,14 +50,15 @@ configure_fastest_mirrors() {
 }
 
 select_kernel() {
-    # Binary kernel options
-    KERNEL_LIST=(
-        "sys-kernel/gentoo-kernel-bin" "Prebuilt Gentoo kernel"
-        "sys-kernel/linux-firmware" "Binary firmware blobs"
-    )
+    KERNEL_CHOICE=$(dialog --title "Kernel Selection" --menu "Select kernel:" 15 45 5 \
+        "gentoo-kernel-bin" "Pre-built generic kernel" \
+        "gentoo-kernel" "Gentoo kernel with custom config" \
+        "vanilla-kernel" "Latest stable upstream kernel" \
+        "linux-hardened" "Hardened kernel with security features" \
+        "linux-zen" "Zen kernel tuned for performance" 3>&1 1>&2 2>&3)
     
-    KERNEL_PKG=$(dialog --title "Kernel Selection" --menu "Select kernel package:" 15 60 6 "${KERNEL_LIST[@]}" 3>&1 1>&2 2>&3)
-    echo "$KERNEL_PKG"
+    # Additional kernel parameters
+    KERNEL_PARAMS=$(dialog --title "Kernel Parameters" --inputbox "Enter additional kernel parameters (leave empty for default):" 8 70 3>&1 1>&2 2>&3)
 }
 
 perform_installation() {
@@ -75,8 +81,8 @@ perform_installation() {
     echo "Username: $USER_NAME"
     echo "Desktop: $DESKTOP_ENV"
     echo "Bootloader: $BOOTLOADER"
-    echo "Kernel: $KERNEL_PKG"
     echo "Init System: $INIT_SYSTEM"
+    echo "Kernel: $KERNEL_CHOICE"
     echo "Compression Level: $COMPRESSION_LEVEL${NC}"
     echo -ne "${CYAN}Continue? (y/n): ${NC}"
     read confirm
@@ -85,20 +91,20 @@ perform_installation() {
         exit 1
     fi
 
-    # Install required tools (binary packages only)
-    cyan_output emerge --quiet --noreplace sys-fs/btrfs-progs parted dosfstools efibootmgr
+    # Install required tools
+    cyan_output emerge --quiet sys-fs/btrfs-progs sys-block/parted sys-fs/dosfstools sys-boot/efibootmgr
 
-    # Partitioning (EXACTLY as in your original)
+    # Partitioning
     cyan_output parted -s "$TARGET_DISK" mklabel gpt
     cyan_output parted -s "$TARGET_DISK" mkpart primary 1MiB 513MiB
     cyan_output parted -s "$TARGET_DISK" set 1 esp on
     cyan_output parted -s "$TARGET_DISK" mkpart primary 513MiB 100%
 
-    # Formatting (EXACTLY as in your original)
+    # Formatting
     cyan_output mkfs.vfat -F32 "${TARGET_DISK}1"
     cyan_output mkfs.btrfs -f "${TARGET_DISK}2"
 
-    # Mounting and subvolumes (EXACTLY as in your original)
+    # Mounting and subvolumes
     cyan_output mount "${TARGET_DISK}2" /mnt
     cyan_output btrfs subvolume create /mnt/@
     cyan_output btrfs subvolume create /mnt/@home
@@ -109,7 +115,7 @@ perform_installation() {
     cyan_output btrfs subvolume create /mnt/@cache
     cyan_output umount /mnt
 
-    # Remount with compression (EXACTLY as in your original)
+    # Remount with compression
     cyan_output mount -o subvol=@,compress=zstd:$COMPRESSION_LEVEL,compress-force=zstd:$COMPRESSION_LEVEL "${TARGET_DISK}2" /mnt
     cyan_output mkdir -p /mnt/boot/efi
     cyan_output mount "${TARGET_DISK}1" /mnt/boot/efi
@@ -126,15 +132,32 @@ perform_installation() {
     cyan_output mount -o subvol=@log,compress=zstd:$COMPRESSION_LEVEL,compress-force=zstd:$COMPRESSION_LEVEL "${TARGET_DISK}2" /mnt/var/log
     cyan_output mount -o subvol=@cache,compress=zstd:$COMPRESSION_LEVEL,compress-force=zstd:$COMPRESSION_LEVEL "${TARGET_DISK}2" /mnt/var/cache
 
-    # Install base system (binary packages only)
-    cyan_output emerge --quiet --noreplace gentoo-base-bin
+    # Determine correct stage3 tarball based on init system
+    case $INIT_SYSTEM in
+        "systemd")
+            STAGE3_TYPE="stage3-amd64-systemd"
+            ;;
+        "OpenRC")
+            STAGE3_TYPE="stage3-amd64-openrc"
+            ;;
+        *)
+            STAGE3_TYPE="stage3-amd64-openrc"
+            ;;
+    esac
 
-    # Mount required filesystems for chroot (EXACTLY as in your original)
+    # Stage 3 tarball installation
+    echo -e "${CYAN}Downloading and extracting $STAGE3_TYPE tarball...${NC}"
+    LATEST_STAGE3=$(curl -s "https://distfiles.gentoo.org/releases/amd64/autobuilds/latest-${STAGE3_TYPE}.txt" | grep -v '#' | awk '{print $1}')
+    wget -q "https://distfiles.gentoo.org/releases/amd64/autobuilds/$LATEST_STAGE3" -O /tmp/stage3.tar.xz
+    tar xpf /tmp/stage3.tar.xz --xattrs-include='*.*' --numeric-owner -C /mnt
+    rm /tmp/stage3.tar.xz
+
+    # Mount required filesystems for chroot
     cyan_output mount -t proc none /mnt/proc
     cyan_output mount --rbind /dev /mnt/dev
     cyan_output mount --rbind /sys /mnt/sys
 
-    # Determine login manager based on desktop environment (EXACTLY as in your original)
+    # Determine login manager based on desktop environment
     case $DESKTOP_ENV in
         "KDE Plasma") LOGIN_MANAGER="sddm" ;;
         "GNOME") LOGIN_MANAGER="gdm" ;;
@@ -142,16 +165,20 @@ perform_installation() {
         *) LOGIN_MANAGER="none" ;;
     esac
 
-    # Chroot setup script (modified for Gentoo binary packages)
+    # Chroot setup script
     cat << CHROOT | tee /mnt/setup-chroot.sh >/dev/null
 #!/bin/bash
 
 # Basic system configuration
 echo "root:$ROOT_PASSWORD" | chpasswd
-useradd -m -G wheel,video,audio,input "$USER_NAME"
+useradd -m -G wheel,audio,video,usb,cdrom,portage "$USER_NAME"
 echo "$USER_NAME:$USER_PASSWORD" | chpasswd
-ln -sf "/usr/share/zoneinfo/$TIMEZONE" /etc/localtime
+ln -sf /usr/share/zoneinfo/$TIMEZONE /etc/localtime
 echo "$HOSTNAME" > /etc/hostname
+echo "en_US.UTF-8 UTF-8" >> /etc/locale.gen
+locale-gen
+eselect locale set en_US.utf8
+env-update && source /etc/profile
 
 # Generate fstab
 cat << EOF > /etc/fstab
@@ -165,79 +192,85 @@ ${TARGET_DISK}2 /var/log btrfs rw,noatime,compress=zstd:$COMPRESSION_LEVEL,compr
 ${TARGET_DISK}2 /var/cache btrfs rw,noatime,compress=zstd:$COMPRESSION_LEVEL,compress-force=zstd:$COMPRESSION_LEVEL,subvol=@cache 0 2
 EOF
 
-# Install kernel (binary package)
-emerge --quiet --noreplace $KERNEL_PKG
+# Configure portage
+mkdir -p /etc/portage/repos.conf
+cp /usr/share/portage/config/repos.conf /etc/portage/repos.conf/gentoo.conf
+emerge-webrsync
 
-# Install desktop environment (binary packages)
+# Set make.conf options
+echo 'USE="X wayland pulseaudio dbus networkmanager"' >> /etc/portage/make.conf
+echo "MAKEOPTS=\"-j$(nproc)\"" >> /etc/portage/make.conf
+
+# Install kernel
+emerge --quiet sys-kernel/$KERNEL_CHOICE
+
+# Configure kernel (if not using binary kernel)
+if [ "$KERNEL_CHOICE" != "gentoo-kernel-bin" ]; then
+    emerge --quiet sys-kernel/linux-firmware
+    emerge --quiet sys-kernel/installkernel-gentoo
+    echo "sys-kernel/$KERNEL_CHOICE $KERNEL_PARAMS" >> /etc/portage/package.use/gentoo-kernel
+fi
+
+# Install desktop environment
 case "$DESKTOP_ENV" in
     "KDE Plasma") 
-        emerge --quiet --noreplace plasma-meta sddm
+        echo "kde-plasma/plasma-meta wayland" >> /etc/portage/package.use/plasma
+        emerge --quiet kde-plasma/plasma-meta
         ;;
     "GNOME") 
-        emerge --quiet --noreplace gnome-base/gnome gdm
+        echo "gnome-base/gnome wayland" >> /etc/portage/package.use/gnome
+        emerge --quiet gnome-base/gnome
         ;;
     "XFCE") 
-        emerge --quiet --noreplace xfce-base/xfce4 lightdm
+        emerge --quiet xfce-base/xfce4-meta
         ;;
     "MATE") 
-        emerge --quiet --noreplace mate-base/mate lightdm
+        emerge --quiet mate-base/mate-desktop
         ;;
     "LXQt") 
-        emerge --quiet --noreplace lxqt-base/lxqt sddm
+        emerge --quiet lxqt-base/lxqt-meta
         ;;
 esac
 
-# Install bootloader (binary package)
+# Install bootloader
 case "$BOOTLOADER" in
     "GRUB")
-        emerge --quiet --noreplace grub efibootmgr
+        emerge --quiet sys-boot/grub
         grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=GENTOO
         grub-mkconfig -o /boot/grub/grub.cfg
         ;;
     "rEFInd")
-        emerge --quiet --noreplace refind
+        emerge --quiet sys-boot/refind
         refind-install
         ;;
 esac
 
 # Configure init system
 case "$INIT_SYSTEM" in
+    "systemd")
+        # systemd is already set up in systemd stage3
+        systemctl enable NetworkManager
+        [ "$LOGIN_MANAGER" != "none" ] && systemctl enable $LOGIN_MANAGER
+        ;;
     "OpenRC")
+        # OpenRC is already set up in OpenRC stage3
         rc-update add dbus default
         rc-update add NetworkManager default
         [ "$LOGIN_MANAGER" != "none" ] && rc-update add $LOGIN_MANAGER default
         ;;
-    "sysvinit")
-        emerge --quiet --noreplace sysvinit
-        for service in dbus NetworkManager $LOGIN_MANAGER; do
-            if [ -f "/etc/init.d/$service" ]; then
-                ln -s /etc/init.d/$service /etc/runlevels/default/
-            fi
-        done
-        ;;
     "runit")
-        emerge --quiet --noreplace runit-openrc
-        mkdir -p /etc/service
-        for service in dbus NetworkManager $LOGIN_MANAGER; do
-            if [ -f "/etc/init.d/$service" ]; then
-                mkdir -p /etc/service/$service
-                echo '#!/bin/sh' > /etc/service/$service/run
-                echo 'exec /etc/init.d/$service start' >> /etc/service/$service/run
-                chmod +x /etc/service/$service/run
-            fi
-        done
+        emerge --quiet sys-process/runit-rc
+        echo "sys-process/runit-rc -openrc" >> /etc/portage/package.use/runit
+        emerge --quiet --config sys-process/runit-rc
+        mkdir -p /etc/runit/runlevels/default
+        ln -s /etc/init.d/NetworkManager /etc/runit/runlevels/default/
+        [ "$LOGIN_MANAGER" != "none" ] && ln -s /etc/init.d/$LOGIN_MANAGER /etc/runit/runlevels/default/
         ;;
     "s6")
-        emerge --quiet --noreplace s6-openrc
-        mkdir -p /etc/s6/sv
-        for service in dbus NetworkManager $LOGIN_MANAGER; do
-            if [ -f "/etc/init.d/$service" ]; then
-                mkdir -p /etc/s6/sv/$service
-                echo '#!/bin/sh' > /etc/s6/sv/$service/run
-                echo 'exec /etc/init.d/$service start' >> /etc/s6/sv/$service/run
-                chmod +x /etc/s6/sv/$service/run
-            fi
-        done
+        emerge --quiet sys-apps/s6 sys-apps/s6-rc
+        mkdir -p /etc/s6/rc/compiled
+        s6-rc-compile /etc/s6/rc/compiled /etc/s6/rc/source
+        # Basic service setup would need to be expanded
         ;;
 esac
 
@@ -248,10 +281,10 @@ CHROOT
     chmod +x /mnt/setup-chroot.sh
     chroot /mnt /setup-chroot.sh
 
-    umount -R /mnt
+    umount -l /mnt
     echo -e "${CYAN}Installation complete!${NC}"
 
-    # Post-install dialog menu (EXACTLY as in your original)
+    # Post-install dialog menu
     while true; do
         choice=$(dialog --clear --title "Installation Complete" \
                        --menu "Select post-install action:" 12 45 5 \
@@ -276,7 +309,7 @@ CHROOT
                 mount --rbind /sys /mnt/sys
                 mount --rbind /dev/pts /mnt/dev/pts
                 chroot /mnt /bin/bash
-                umount -R /mnt
+                umount -l /mnt
                 ;;
             3)
                 clear
@@ -298,7 +331,7 @@ configure_installation() {
     USER_PASSWORD=$(dialog --title "User Password" --passwordbox "Enter user password:" 8 40 3>&1 1>&2 2>&3)
     ROOT_PASSWORD=$(dialog --title "Root Password" --passwordbox "Enter root password:" 8 40 3>&1 1>&2 2>&3)
     
-    # Desktop environment selection (EXACTLY as in your original)
+    # Desktop environment selection
     DESKTOP_ENV=$(dialog --title "Desktop Environment" --menu "Select desktop:" 15 40 6 \
         "KDE Plasma" "KDE Plasma Desktop" \
         "GNOME" "GNOME Desktop" \
@@ -307,23 +340,24 @@ configure_installation() {
         "LXQt" "LXQt Desktop" \
         "None" "No desktop environment" 3>&1 1>&2 2>&3)
     
-    # Bootloader selection (EXACTLY as in your original)
+    # Bootloader selection
     BOOTLOADER=$(dialog --title "Bootloader Selection" --menu "Select bootloader:" 15 40 2 \
         "GRUB" "GRUB (recommended)" \
         "rEFInd" "Graphical boot manager" 3>&1 1>&2 2>&3)
     
-    # Init system selection (EXACTLY as in your original)
+    # Init system selection
     INIT_SYSTEM=$(dialog --title "Init System Selection" --menu "Select init system:" 15 40 4 \
-        "OpenRC" "Gentoo's default init system" \
-        "sysvinit" "Traditional System V init" \
+        "systemd" "Systemd init system" \
+        "OpenRC" "Gentoo's traditional init system" \
         "runit" "Runit init system" \
         "s6" "s6 init system" 3>&1 1>&2 2>&3)
     
-    KERNEL_PKG=$(select_kernel)
+    # Kernel selection
+    select_kernel
     
     COMPRESSION_LEVEL=$(dialog --title "Compression Level" --inputbox "Enter BTRFS compression level (1-22, default is 22):" 8 40 22 3>&1 1>&2 2>&3)
     
-    # Validate compression level (EXACTLY as in your original)
+    # Validate compression level
     if ! [[ "$COMPRESSION_LEVEL" =~ ^[0-9]+$ ]] || [ "$COMPRESSION_LEVEL" -lt 1 ] || [ "$COMPRESSION_LEVEL" -gt 22 ]; then
         dialog --msgbox "Invalid compression level. Using default (22)." 6 40
         COMPRESSION_LEVEL=22
