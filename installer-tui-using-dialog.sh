@@ -21,7 +21,7 @@ show_ascii() {
 ██║░░██╗██║░░░░░██╔══██║██║░░░██║██║░░██║██╔══╝░░██║╚██╔╝██║██║░░██║██║░░██║░╚═══██╗
 ╚█████╔╝███████╗██║░░██║╚██████╔╝██████╔╝███████╗██║░╚═╝░██║╚█████╔╝██████╔╝██████╔╝
 ░╚════╝░╚══════╝╚═╝░░╚═╝░╚═════╝░╚═════╝░╚══════╝╚═╝░░░░░╚═╝░╚════╝░╚═════╝░╚═════╝░${NC}"
-    echo -e "${CYAN}Gentoo Btrfs Installer v1.02 12-07-2025${NC}"
+    echo -e "${CYAN}Gentoo Btrfs Installer v1.03 12-07-2025${NC}"
     echo
 }
 
@@ -61,50 +61,91 @@ select_kernel() {
     KERNEL_PARAMS=$(dialog --title "Kernel Parameters" --inputbox "Enter additional kernel parameters (leave empty for default):" 8 70 3>&1 1>&2 2>&3)
 }
 
-install_kernel() {
-    if [ "$KERNEL_CHOICE" = "gentoo-kernel-bin" ]; then
-        # Install binary kernel
-        cyan_output emerge --quiet sys-kernel/gentoo-kernel-bin
+install_kernel_bin() {
+    echo -e "${CYAN}Installing pre-built kernel...${NC}"
+    cyan_output emerge --quiet sys-kernel/gentoo-kernel-bin
+    cyan_output emerge --quiet sys-kernel/linux-firmware
+}
+
+install_kernel_sources() {
+    local kernel_sources=$1
+    echo -e "${CYAN}Installing $kernel_sources...${NC}"
+    
+    # Install kernel sources and firmware
+    cyan_output emerge --quiet sys-kernel/${kernel_sources}
+    cyan_output emerge --quiet sys-kernel/linux-firmware
+    cyan_output emerge --quiet sys-kernel/installkernel-gentoo
+    
+    # Configure kernel
+    cd /usr/src/linux
+    echo -e "${CYAN}Configuring kernel...${NC}"
+    
+    # Try to use existing config if available
+    if [ -f /proc/config.gz ]; then
+        zcat /proc/config.gz > .config
+        make olddefconfig
     else
-        # Install kernel sources
-        cyan_output emerge --quiet sys-kernel/${KERNEL_CHOICE}
-        cyan_output emerge --quiet sys-kernel/linux-firmware
-        
-        # Configure kernel
-        cd /usr/src/linux
-        if [ ! -f .config ]; then
-            if [ -f /proc/config.gz ]; then
-                zcat /proc/config.gz > .config
-            else
-                make defconfig
-            fi
-        fi
-        
-        # Make kernel configuration more user-friendly
-        if command -v nconfig >/dev/null; then
-            make nconfig
-        elif command -v menuconfig >/dev/null; then
-            make menuconfig
-        else
-            echo -e "${CYAN}No kernel configurator found, using default config${NC}"
-        fi
-        
-        # Compile and install kernel
-        cyan_output make -j$(nproc)
-        cyan_output make modules_install
-        cyan_output make install
-        
-        # Generate initramfs
-        cyan_output emerge --quiet sys-kernel/dracut
-        dracut --hostonly --kver $(ls /lib/modules | sort -V | tail -n 1)
+        make defconfig
     fi
     
-    # Update bootloader configuration
-    if [ "$BOOTLOADER" = "GRUB" ]; then
-        grub-mkconfig -o /boot/grub/grub.cfg
-    elif [ "$BOOTLOADER" = "rEFInd" ]; then
-        refind-install
-    fi
+    # Enable common options needed for booting
+    echo -e "${CYAN}Setting recommended kernel options...${NC}"
+    ./scripts/config --enable BLK_DEV_INITRD
+    ./scripts/config --enable DEVTMPFS
+    ./scripts/config --enable DEVTMPFS_MOUNT
+    ./scripts/config --enable TMPFS
+    ./scripts/config --enable TMPFS_POSIX_ACL
+    ./scripts/config --enable BTRFS_FS
+    ./scripts/config --enable EFI_STUB
+    ./scripts/config --enable EFI
+    ./scripts/config --enable EFIVAR_FS
+    
+    # For UEFI systems
+    ./scripts/config --enable EFI_PARTITION
+    ./scripts/config --enable EFI_VARS
+    
+    # Save the config
+    make savedefconfig
+    cp defconfig .config
+    
+    # Compile kernel
+    echo -e "${CYAN}Compiling kernel...${NC}"
+    cyan_output make -j$(nproc)
+    
+    # Install kernel
+    echo -e "${CYAN}Installing kernel...${NC}"
+    cyan_output make modules_install
+    cyan_output make install
+    
+    # Generate initramfs
+    echo -e "${CYAN}Generating initramfs...${NC}"
+    cyan_output emerge --quiet sys-kernel/dracut
+    dracut --hostonly --kver $(ls /lib/modules | sort -V | tail -n 1)
+}
+
+install_kernel() {
+    case "$KERNEL_CHOICE" in
+        "gentoo-kernel-bin")
+            install_kernel_bin
+            ;;
+        "gentoo-sources"|"vanilla-sources"|"hardened-sources"|"linux-zen-sources")
+            install_kernel_sources "$KERNEL_CHOICE"
+            ;;
+        *)
+            echo -e "${CYAN}Invalid kernel choice, defaulting to gentoo-kernel-bin${NC}"
+            install_kernel_bin
+            ;;
+    esac
+    
+    # Update bootloader
+    case "$BOOTLOADER" in
+        "GRUB")
+            grub-mkconfig -o /boot/grub/grub.cfg
+            ;;
+        "rEFInd")
+            refind-install
+            ;;
+    esac
 }
 
 perform_installation() {
@@ -247,9 +288,11 @@ emerge-webrsync
 echo 'USE="X wayland pulseaudio dbus networkmanager"' >> /etc/portage/make.conf
 echo "MAKEOPTS=\"-j$(nproc)\"" >> /etc/portage/make.conf
 
-# Install kernel and related tools
-emerge --quiet sys-kernel/installkernel-gentoo
-$(declare -f install_kernel)
+# Install necessary tools
+emerge --quiet sys-apps/pciutils sys-apps/usbutils
+
+# Install kernel
+$(declare -f install_kernel_bin install_kernel_sources install_kernel cyan_output)
 install_kernel
 
 # Install desktop environment
@@ -311,7 +354,6 @@ case "$INIT_SYSTEM" in
         emerge --quiet sys-apps/s6 sys-apps/s6-rc
         mkdir -p /etc/s6/rc/compiled
         s6-rc-compile /etc/s6/rc/compiled /etc/s6/rc/source
-        # Basic service setup would need to be expanded
         ;;
 esac
 
@@ -407,7 +449,7 @@ configure_installation() {
 
 main_menu() {
     while true; do
-        choice=$(dialog --clear --title "Gentoo Btrfs Installer v1.02 12-07-2025" \
+        choice=$(dialog --clear --title "Gentoo Btrfs Installer v1.03 12-07-2025" \
                        --menu "Select option:" 15 45 6 \
                        1 "Configure Installation" \
                        2 "Find Fastest Mirrors" \
